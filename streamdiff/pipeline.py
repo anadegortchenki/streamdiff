@@ -1,92 +1,93 @@
-"""High-level pipeline: read → diff → filter → format."""
+"""High-level pipeline: wire reader → differ → filter → stats, with optional checkpoint."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
-from typing import IO, Iterator, List, Optional
+from pathlib import Path
+from typing import Iterator, List, Optional
 
-from streamdiff.differ import ChangeType, DiffRecord, diff_streams
-from streamdiff.filter import apply_filters
-from streamdiff.formatter import OutputFormat, format_json, format_text, format_unified
+from streamdiff.differ import DiffRecord, diff_streams, ChangeType
+from streamdiff.filter import apply_filters, filter_unchanged
 from streamdiff.reader import stream_lines
 from streamdiff.stats import DiffStats
+from streamdiff.checkpoint import (
+    Checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+    delete_checkpoint,
+)
 
 
 @dataclass
 class PipelineConfig:
-    """All knobs for a single diff pipeline run."""
-
-    output_format: OutputFormat = OutputFormat.TEXT
-    skip_unchanged: bool = False
+    left_path: str
+    right_path: str
+    show_unchanged: bool = False
     change_types: Optional[List[ChangeType]] = None
     pattern: Optional[str] = None
-    pattern_flags: int = 0
-    context_lines: int = 3  # used by unified format
-    color: bool = True
+    checkpoint_path: Optional[str] = None
 
 
 @dataclass
 class PipelineResult:
-    """Outcome of :func:`run_pipeline`."""
-
-    lines: List[str] = field(default_factory=list)
+    records: List[DiffRecord] = field(default_factory=list)
     stats: DiffStats = field(default_factory=DiffStats)
 
 
 def _records_with_stats(
-    records: Iterator[DiffRecord],
-    stats: DiffStats,
-) -> Iterator[DiffRecord]:
-    """Pass-through iterator that accumulates stats as records flow."""
-    for record in records:
-        stats.update(record)
-        yield record
+    source: Iterator[DiffRecord],
+) -> tuple[list[DiffRecord], DiffStats]:
+    stats = DiffStats()
+    records: list[DiffRecord] = []
+    for rec in source:
+        stats.update(rec)
+        records.append(rec)
+    return records, stats
 
 
-def run_pipeline(
-    left: IO[str],
-    right: IO[str],
-    config: Optional[PipelineConfig] = None,
-) -> PipelineResult:
-    """Execute the full diff pipeline and return formatted lines + stats.
+def _skip_lines(stream: Iterator[str], n: int) -> Iterator[str]:
+    for _ in range(n):
+        try:
+            next(stream)
+        except StopIteration:
+            return
+    yield from stream
 
-    Parameters
-    ----------
-    left:
-        File-like object for the *old* stream.
-    right:
-        File-like object for the *new* stream.
-    config:
-        Pipeline configuration; defaults to :class:`PipelineConfig` defaults.
-    """
-    if config is None:
-        config = PipelineConfig()
 
-    result = PipelineResult()
+def run_pipeline(config: PipelineConfig) -> PipelineResult:
+    """Execute the full diff pipeline according to *config*."""
+    checkpoint: Checkpoint = Checkpoint()
+    if config.checkpoint_path:
+        loaded = load_checkpoint(config.checkpoint_path)
+        if loaded is not None:
+            checkpoint = loaded
 
-    left_lines = stream_lines(left)
-    right_lines = stream_lines(right)
+    left_stream = stream_lines(config.left_path)
+    right_stream = stream_lines(config.right_path)
 
-    raw_records = diff_streams(left_lines, right_lines)
+    if not checkpoint.is_fresh():
+        left_stream = _skip_lines(left_stream, checkpoint.left_offset)
+        right_stream = _skip_lines(right_stream, checkpoint.right_offset)
 
-    tracked = _records_with_stats(raw_records, result.stats)
-
+    raw = diff_streams(left_stream, right_stream)
     filtered = apply_filters(
-        tracked,
+        raw,
         change_types=config.change_types,
         pattern=config.pattern,
-        pattern_flags=config.pattern_flags,
-        skip_unchanged=config.skip_unchanged,
     )
+    if not config.show_unchanged:
+        filtered = filter_unchanged(filtered)
 
-    fmt = config.output_format
-    if fmt == OutputFormat.JSON:
-        output_iter = format_json(filtered)
-    elif fmt == OutputFormat.UNIFIED:
-        output_iter = format_unified(filtered, context=config.context_lines)
-    else:
-        output_iter = format_text(filtered, color=config.color)
+    records, stats = _records_with_stats(filtered)
 
-    result.lines = list(output_iter)
-    return result
+    if config.checkpoint_path:
+        new_cp = Checkpoint(
+            left_offset=checkpoint.left_offset + stats.total,
+            right_offset=checkpoint.right_offset + stats.total,
+        )
+        if stats.total > 0:
+            save_checkpoint(config.checkpoint_path, new_cp)
+        else:
+            delete_checkpoint(config.checkpoint_path)
+
+    return PipelineResult(records=records, stats=stats)
