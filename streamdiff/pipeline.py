@@ -1,93 +1,90 @@
-"""High-level pipeline: wire reader → differ → filter → stats, with optional checkpoint."""
-
+"""High-level pipeline: wire reader → differ → filter → stats → report."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Iterator, List, Optional
 
-from streamdiff.differ import DiffRecord, diff_streams, ChangeType
+from streamdiff.differ import DiffRecord, ChangeType, diff_streams
 from streamdiff.filter import apply_filters, filter_unchanged
-from streamdiff.reader import stream_lines
 from streamdiff.stats import DiffStats
-from streamdiff.checkpoint import (
-    Checkpoint,
-    load_checkpoint,
-    save_checkpoint,
-    delete_checkpoint,
-)
+from streamdiff.reporter import DiffReport, build_report
+from streamdiff.export import ExportFormat, export_report
 
 
 @dataclass
 class PipelineConfig:
-    left_path: str
-    right_path: str
-    show_unchanged: bool = False
+    left_source: str
+    right_source: str
+    include_unchanged: bool = False
     change_types: Optional[List[ChangeType]] = None
     pattern: Optional[str] = None
-    checkpoint_path: Optional[str] = None
+    report_format: ExportFormat = ExportFormat.TEXT
+    report_output: Optional[str] = None  # None → stdout
+    emit_report: bool = True
 
 
 @dataclass
 class PipelineResult:
-    records: List[DiffRecord] = field(default_factory=list)
-    stats: DiffStats = field(default_factory=DiffStats)
+    records: List[DiffRecord]
+    stats: DiffStats
+    report: Optional[DiffReport] = None
+    elapsed_seconds: float = 0.0
 
 
 def _records_with_stats(
-    source: Iterator[DiffRecord],
-) -> tuple[list[DiffRecord], DiffStats]:
+    stream: Iterator[DiffRecord],
+) -> tuple[List[DiffRecord], DiffStats]:
     stats = DiffStats()
-    records: list[DiffRecord] = []
-    for rec in source:
-        stats.update(rec)
+    records: List[DiffRecord] = []
+    for rec in stream:
         records.append(rec)
+        if rec.change_type is ChangeType.ADDED:
+            stats.added += 1
+        elif rec.change_type is ChangeType.REMOVED:
+            stats.removed += 1
+        else:
+            stats.unchanged += 1
+    stats._recalc()
     return records, stats
 
 
-def _skip_lines(stream: Iterator[str], n: int) -> Iterator[str]:
-    for _ in range(n):
-        try:
-            next(stream)
-        except StopIteration:
-            return
-    yield from stream
+def _skip_lines(records: List[DiffRecord], n: int) -> List[DiffRecord]:
+    return records[n:]
 
 
-def run_pipeline(config: PipelineConfig) -> PipelineResult:
-    """Execute the full diff pipeline according to *config*."""
-    checkpoint: Checkpoint = Checkpoint()
-    if config.checkpoint_path:
-        loaded = load_checkpoint(config.checkpoint_path)
-        if loaded is not None:
-            checkpoint = loaded
+def run_pipeline(
+    left_iter: Iterator[str],
+    right_iter: Iterator[str],
+    config: PipelineConfig,
+) -> PipelineResult:
+    start = time.monotonic()
 
-    left_stream = stream_lines(config.left_path)
-    right_stream = stream_lines(config.right_path)
+    raw = diff_streams(left_iter, right_iter)
 
-    if not checkpoint.is_fresh():
-        left_stream = _skip_lines(left_stream, checkpoint.left_offset)
-        right_stream = _skip_lines(right_stream, checkpoint.right_offset)
+    filters = []
+    if not config.include_unchanged:
+        filters.append(filter_unchanged)
 
-    raw = diff_streams(left_stream, right_stream)
-    filtered = apply_filters(
-        raw,
-        change_types=config.change_types,
-        pattern=config.pattern,
-    )
-    if not config.show_unchanged:
-        filtered = filter_unchanged(filtered)
+    filtered = apply_filters(raw, filters)
 
     records, stats = _records_with_stats(filtered)
 
-    if config.checkpoint_path:
-        new_cp = Checkpoint(
-            left_offset=checkpoint.left_offset + stats.total,
-            right_offset=checkpoint.right_offset + stats.total,
-        )
-        if stats.total > 0:
-            save_checkpoint(config.checkpoint_path, new_cp)
-        else:
-            delete_checkpoint(config.checkpoint_path)
+    elapsed = time.monotonic() - start
 
-    return PipelineResult(records=records, stats=stats)
+    report: Optional[DiffReport] = None
+    if config.emit_report:
+        report = build_report(
+            stats,
+            left_source=config.left_source,
+            right_source=config.right_source,
+            elapsed_seconds=elapsed,
+        )
+        export_report(report, fmt=config.report_format, output_path=config.report_output)
+
+    return PipelineResult(
+        records=records,
+        stats=stats,
+        report=report,
+        elapsed_seconds=elapsed,
+    )
